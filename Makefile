@@ -37,7 +37,7 @@ build-react-app:
 	cd ui/react-app && npm install && npm run build
 
 .PHONY: assets-compress
-assets-compress:
+assets-compress: build-react-app
 	@echo '>> compressing assets'
 	scripts/compress_assets.sh
 
@@ -65,7 +65,7 @@ SWAGGER = docker run \
 	--user=$(shell id -u $(USER)):$(shell id -g $(USER)) \
 	--rm \
 	-v $(shell pwd):/go/src/github.com/prometheus/alertmanager \
-	-w /go/src/github.com/prometheus/alertmanager quay.io/goswagger/swagger:v0.30.3
+	-w /go/src/github.com/prometheus/alertmanager quay.io/goswagger/swagger:v0.30.5
 
 api/v2/models api/v2/restapi api/v2/client: api/v2/openapi.yaml
 	-rm -r api/v2/{client,models,restapi}
