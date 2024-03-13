@@ -79,7 +79,7 @@ func TestGC(t *testing.T) {
 		done        = make(chan struct{})
 		ctx, cancel = context.WithCancel(context.Background())
 	)
-	s.SetGCCallback(func(a []*types.Alert) {
+	s.SetGCCallback(func(a []types.Alert) {
 		n += len(a)
 		if n >= len(resolved) {
 			cancel()
@@ -109,5 +109,5 @@ func TestGC(t *testing.T) {
 			t.Errorf("alert %v should have been gc'd", alert)
 		}
 	}
-	require.Equal(t, len(resolved), n)
+	require.Len(t, resolved, n)
 }

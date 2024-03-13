@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -31,7 +32,6 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
@@ -45,38 +45,31 @@ import (
 	"github.com/prometheus/alertmanager/api"
 	"github.com/prometheus/alertmanager/cluster"
 	"github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/config/receiver"
 	"github.com/prometheus/alertmanager/dispatch"
 	"github.com/prometheus/alertmanager/featurecontrol"
 	"github.com/prometheus/alertmanager/inhibit"
+	"github.com/prometheus/alertmanager/matchers/compat"
 	"github.com/prometheus/alertmanager/nflog"
 	"github.com/prometheus/alertmanager/notify"
-	"github.com/prometheus/alertmanager/notify/discord"
-	"github.com/prometheus/alertmanager/notify/email"
-	"github.com/prometheus/alertmanager/notify/msteams"
-	"github.com/prometheus/alertmanager/notify/opsgenie"
-	"github.com/prometheus/alertmanager/notify/pagerduty"
-	"github.com/prometheus/alertmanager/notify/pushover"
-	"github.com/prometheus/alertmanager/notify/slack"
-	"github.com/prometheus/alertmanager/notify/sns"
-	"github.com/prometheus/alertmanager/notify/telegram"
-	"github.com/prometheus/alertmanager/notify/victorops"
-	"github.com/prometheus/alertmanager/notify/webex"
-	"github.com/prometheus/alertmanager/notify/webhook"
-	"github.com/prometheus/alertmanager/notify/wechat"
 	"github.com/prometheus/alertmanager/provider/mem"
 	"github.com/prometheus/alertmanager/silence"
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/alertmanager/timeinterval"
 	"github.com/prometheus/alertmanager/types"
 	"github.com/prometheus/alertmanager/ui"
+	reactapp "github.com/prometheus/alertmanager/ui/react-app"
 )
 
 var (
 	requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "alertmanager_http_request_duration_seconds",
-			Help:    "Histogram of latencies for HTTP requests.",
-			Buckets: []float64{.05, 0.1, .25, .5, .75, 1, 2, 5, 20, 60},
+			Name:                            "alertmanager_http_request_duration_seconds",
+			Help:                            "Histogram of latencies for HTTP requests.",
+			Buckets:                         []float64{.05, 0.1, .25, .5, .75, 1, 2, 5, 20, 60},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: 1 * time.Hour,
 		},
 		[]string{"handler", "method"},
 	)
@@ -106,6 +99,11 @@ var (
 			Help: "Number of configured integrations.",
 		},
 	)
+	configuredInhibitionRules = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "alertmanager_inhibition_rules",
+			Help: "Number of configured inhibition rules.",
+		})
 	promlogConfig = promlog.Config{}
 )
 
@@ -115,6 +113,7 @@ func init() {
 	prometheus.MustRegister(clusterEnabled)
 	prometheus.MustRegister(configuredReceivers)
 	prometheus.MustRegister(configuredIntegrations)
+	prometheus.MustRegister(configuredInhibitionRules)
 	prometheus.MustRegister(version.NewCollector("alertmanager"))
 }
 
@@ -130,68 +129,6 @@ func instrumentHandler(handlerName string, handler http.HandlerFunc) http.Handle
 }
 
 const defaultClusterAddr = "0.0.0.0:9094"
-
-// buildReceiverIntegrations builds a list of integration notifiers off of a
-// receiver config.
-func buildReceiverIntegrations(nc config.Receiver, tmpl *template.Template, logger log.Logger) ([]notify.Integration, error) {
-	var (
-		errs         types.MultiError
-		integrations []notify.Integration
-		add          = func(name string, i int, rs notify.ResolvedSender, f func(l log.Logger) (notify.Notifier, error)) {
-			n, err := f(log.With(logger, "integration", name))
-			if err != nil {
-				errs.Add(err)
-				return
-			}
-			integrations = append(integrations, notify.NewIntegration(n, rs, name, i, nc.Name))
-		}
-	)
-
-	for i, c := range nc.WebhookConfigs {
-		add("webhook", i, c, func(l log.Logger) (notify.Notifier, error) { return webhook.New(c, tmpl, l) })
-	}
-	for i, c := range nc.EmailConfigs {
-		add("email", i, c, func(l log.Logger) (notify.Notifier, error) { return email.New(c, tmpl, l), nil })
-	}
-	for i, c := range nc.PagerdutyConfigs {
-		add("pagerduty", i, c, func(l log.Logger) (notify.Notifier, error) { return pagerduty.New(c, tmpl, l) })
-	}
-	for i, c := range nc.OpsGenieConfigs {
-		add("opsgenie", i, c, func(l log.Logger) (notify.Notifier, error) { return opsgenie.New(c, tmpl, l) })
-	}
-	for i, c := range nc.WechatConfigs {
-		add("wechat", i, c, func(l log.Logger) (notify.Notifier, error) { return wechat.New(c, tmpl, l) })
-	}
-	for i, c := range nc.SlackConfigs {
-		add("slack", i, c, func(l log.Logger) (notify.Notifier, error) { return slack.New(c, tmpl, l) })
-	}
-	for i, c := range nc.VictorOpsConfigs {
-		add("victorops", i, c, func(l log.Logger) (notify.Notifier, error) { return victorops.New(c, tmpl, l) })
-	}
-	for i, c := range nc.PushoverConfigs {
-		add("pushover", i, c, func(l log.Logger) (notify.Notifier, error) { return pushover.New(c, tmpl, l) })
-	}
-	for i, c := range nc.SNSConfigs {
-		add("sns", i, c, func(l log.Logger) (notify.Notifier, error) { return sns.New(c, tmpl, l) })
-	}
-	for i, c := range nc.TelegramConfigs {
-		add("telegram", i, c, func(l log.Logger) (notify.Notifier, error) { return telegram.New(c, tmpl, l) })
-	}
-	for i, c := range nc.DiscordConfigs {
-		add("discord", i, c, func(l log.Logger) (notify.Notifier, error) { return discord.New(c, tmpl, l) })
-	}
-	for i, c := range nc.WebexConfigs {
-		add("webex", i, c, func(l log.Logger) (notify.Notifier, error) { return webex.New(c, tmpl, l) })
-	}
-	for i, c := range nc.MSTeamsConfigs {
-		add("msteams", i, c, func(l log.Logger) (notify.Notifier, error) { return msteams.New(c, tmpl, l) })
-	}
-
-	if errs.Len() > 0 {
-		return nil, &errs
-	}
-	return integrations, nil
-}
 
 func main() {
 	os.Exit(run())
@@ -247,11 +184,12 @@ func run() int {
 	level.Info(logger).Log("msg", "Starting Alertmanager", "version", version.Info())
 	level.Info(logger).Log("build_context", version.BuildContext())
 
-	featureConfig, err := featurecontrol.NewFlags(logger, *featureFlags)
+	ff, err := featurecontrol.NewFlags(logger, *featureFlags)
 	if err != nil {
 		level.Error(logger).Log("msg", "error parsing the feature flag list", "err", err)
 		return 1
 	}
+	compat.InitFromFlags(logger, ff)
 
 	err = os.MkdirAll(*dataDir, 0o777)
 	if err != nil {
@@ -401,7 +339,7 @@ func run() int {
 		GroupFunc:   groupFn,
 	})
 	if err != nil {
-		level.Error(logger).Log("err", errors.Wrap(err, "failed to create API"))
+		level.Error(logger).Log("err", fmt.Errorf("failed to create API: %w", err))
 		return 1
 	}
 
@@ -429,7 +367,7 @@ func run() int {
 	)
 
 	dispMetrics := dispatch.NewDispatcherMetrics(false, prometheus.DefaultRegisterer)
-	pipelineBuilder := notify.NewPipelineBuilder(prometheus.DefaultRegisterer, featureConfig)
+	pipelineBuilder := notify.NewPipelineBuilder(prometheus.DefaultRegisterer, ff)
 	configLogger := log.With(logger, "component", "configuration")
 	configCoordinator := config.NewCoordinator(
 		*configFile,
@@ -439,7 +377,7 @@ func run() int {
 	configCoordinator.Subscribe(func(conf *config.Config) error {
 		tmpl, err = template.FromGlobs(conf.Templates)
 		if err != nil {
-			return errors.Wrap(err, "failed to parse templates")
+			return fmt.Errorf("failed to parse templates: %w", err)
 		}
 		tmpl.ExternalURL = amURL
 
@@ -459,7 +397,7 @@ func run() int {
 				level.Info(configLogger).Log("msg", "skipping creation of receiver not referenced by any route", "receiver", rcv.Name)
 				continue
 			}
-			integrations, err := buildReceiverIntegrations(rcv, tmpl, logger)
+			integrations, err := receiver.BuildReceiverIntegrations(rcv, tmpl, logger)
 			if err != nil {
 				return err
 			}
@@ -506,6 +444,7 @@ func run() int {
 
 		configuredReceivers.Set(float64(len(activeReceivers)))
 		configuredIntegrations.Set(float64(integrationsNum))
+		configuredInhibitionRules.Set(float64(len(conf.InhibitRules)))
 
 		api.Update(conf, func(labels model.LabelSet) {
 			inhibitor.Mutes(labels)
@@ -569,6 +508,7 @@ func run() int {
 	webReload := make(chan chan error)
 
 	ui.Register(router, webReload, logger)
+	reactapp.Register(router, logger)
 
 	mux := api.Register(router, *routePrefix)
 
@@ -576,7 +516,7 @@ func run() int {
 	srvc := make(chan struct{})
 
 	go func() {
-		if err := web.ListenAndServe(srv, webConfig, logger); err != http.ErrServerClosed {
+		if err := web.ListenAndServe(srv, webConfig, logger); !errors.Is(err, http.ErrServerClosed) {
 			level.Error(logger).Log("msg", "Listen error", "err", err)
 			close(srvc)
 		}
@@ -640,7 +580,7 @@ func extURL(logger log.Logger, hostnamef func() (string, error), listen, externa
 		return nil, err
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, errors.Errorf("%q: invalid %q scheme, only 'http' and 'https' are supported", u.String(), u.Scheme)
+		return nil, fmt.Errorf("%q: invalid %q scheme, only 'http' and 'https' are supported", u.String(), u.Scheme)
 	}
 
 	ppref := strings.TrimRight(u.Path, "/")
